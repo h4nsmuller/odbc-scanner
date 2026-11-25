@@ -6,6 +6,7 @@ using idx_t = duckdb::cxx::idx_t;
 
 namespace odbcscanner {
 
+using duckdb::cxx::bignum_t;
 using duckdb::cxx::blob_t;
 using duckdb::cxx::Connection;
 using duckdb::cxx::Context;

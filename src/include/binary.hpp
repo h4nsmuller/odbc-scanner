@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "duckdb_extension_api.hpp"
@@ -26,6 +27,8 @@ struct DecimalChars {
 	DecimalChars();
 
 	explicit DecimalChars(DecimalValue decimal);
+
+	explicit DecimalChars(const std::string &text);
 
 	DecimalChars(DecimalChars &other) = delete;
 	DecimalChars(DecimalChars &&other) = default;

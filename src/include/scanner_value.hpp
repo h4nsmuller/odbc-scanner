@@ -125,6 +125,7 @@ public:
 	explicit ScannerValue(float value);
 	explicit ScannerValue(double value);
 	explicit ScannerValue(DecimalValue value, bool decimal_as_chars);
+	explicit ScannerValue(DecimalChars value);
 	explicit ScannerValue(SQL_NUMERIC_STRUCT value);
 	explicit ScannerValue(const char *cstr, size_t len);
 	explicit ScannerValue(const char *cstr);

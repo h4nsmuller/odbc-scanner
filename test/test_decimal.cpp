@@ -375,3 +375,148 @@ FROM odbc_query(
 	REQUIRE(res.DecimalValue<int128_t>(1, 0).lower == 12ULL);
 	REQUIRE(res.DecimalValue<int128_t>(1, 0).upper == -2LL);
 }
+
+// DECIMALs wider than 38 digits are not available in older DuckDB versions
+static bool WideDecimalsAvailable(ScannerConn &sc) {
+	Result res;
+	return Query(sc.conn, "SELECT '1'::DECIMAL(39, 0)", res);
+}
+
+TEST_CASE("Decimal wide query with literals", group_name) {
+	if (!DBMSConfigured("PostgreSQL")) {
+		return;
+	}
+	ScannerConn sc;
+	if (!WideDecimalsAvailable(sc)) {
+		return;
+	}
+	Result res;
+	bool st = Query(sc.conn,
+	                R"(
+SELECT col1::VARCHAR, col2::VARCHAR, col3::VARCHAR, col4::VARCHAR, typeof(col1), typeof(col4)
+FROM odbc_query(
+  getvariable('conn'),
+  '
+    SELECT
+      CAST(''1234567890123456789012345678901234567890.0123456789'' AS NUMERIC(50, 10)) AS col1,
+      CAST(''-1234567890123456789012345678901234567890.0123456789'' AS NUMERIC(50, 10)) AS col2,
+      CAST(''0'' AS NUMERIC(50, 10)) AS col3,
+      CAST(''-1.5'' AS NUMERIC(39, 1)) AS col4
+  ')
+)",
+	                res);
+	REQUIRE(QuerySuccess(res, st));
+	REQUIRE(res.NextChunk());
+	REQUIRE(res.Value<std::string>(0, 0) == "1234567890123456789012345678901234567890.0123456789");
+	REQUIRE(res.Value<std::string>(1, 0) == "-1234567890123456789012345678901234567890.0123456789");
+	REQUIRE(res.Value<std::string>(2, 0) == "0.0000000000");
+	REQUIRE(res.Value<std::string>(3, 0) == "-1.5");
+	REQUIRE(res.Value<std::string>(4, 0) == "DECIMAL(50,10)");
+	REQUIRE(res.Value<std::string>(5, 0) == "DECIMAL(39,1)");
+}
+
+TEST_CASE("Decimal wide query with a NULL", group_name) {
+	if (!DBMSConfigured("PostgreSQL")) {
+		return;
+	}
+	ScannerConn sc;
+	if (!WideDecimalsAvailable(sc)) {
+		return;
+	}
+	Result res;
+	bool st = Query(sc.conn,
+	                R"(
+SELECT col1 IS NULL
+FROM odbc_query(
+  getvariable('conn'),
+  '
+    SELECT CAST(NULL AS NUMERIC(50, 10)) AS col1
+  ')
+)",
+	                res);
+	REQUIRE(QuerySuccess(res, st));
+	REQUIRE(res.NextChunk());
+	REQUIRE(res.Value<bool>(0, 0));
+}
+
+TEST_CASE("Decimal wide query with max width values", group_name) {
+	if (!DBMSConfigured("PostgreSQL")) {
+		return;
+	}
+	ScannerConn sc;
+	if (!WideDecimalsAvailable(sc)) {
+		return;
+	}
+	Result res;
+	bool st = Query(sc.conn,
+	                R"(
+SELECT col1::VARCHAR, col2::VARCHAR, col3 = ('-0.' || repeat('9', 255))::DECIMAL(255, 255), typeof(col1), typeof(col3)
+FROM odbc_query(
+  getvariable('conn'),
+  '
+    SELECT
+      CAST(repeat(''9'', 255) AS NUMERIC(255, 0)) AS col1,
+      CAST(''-'' || repeat(''9'', 255) AS NUMERIC(255, 0)) AS col2,
+      CAST(''-0.'' || repeat(''9'', 255) AS NUMERIC(255, 255)) AS col3
+  ')
+)",
+	                res);
+	REQUIRE(QuerySuccess(res, st));
+	REQUIRE(res.NextChunk());
+	REQUIRE(res.Value<std::string>(0, 0) == std::string(255, '9'));
+	REQUIRE(res.Value<std::string>(1, 0) == "-" + std::string(255, '9'));
+	REQUIRE(res.Value<bool>(2, 0));
+	REQUIRE(res.Value<std::string>(3, 0) == "DECIMAL(255,0)");
+	REQUIRE(res.Value<std::string>(4, 0) == "DECIMAL(255,255)");
+}
+
+TEST_CASE("Decimal wide query with literal parameters", group_name) {
+	if (!DBMSConfigured("PostgreSQL")) {
+		return;
+	}
+	ScannerConn sc;
+	if (!WideDecimalsAvailable(sc)) {
+		return;
+	}
+	Result res;
+	bool st = Query(sc.conn,
+	                R"(
+SELECT col1::VARCHAR, col2::VARCHAR
+FROM odbc_query(
+  getvariable('conn'),
+  '
+    SELECT CAST(? AS NUMERIC(50, 10)) AS col1, CAST(? AS NUMERIC(255, 0)) AS col2
+  ',
+  params=row(
+    '-1234567890123456789012345678901234567890.0123456789'::DECIMAL(50, 10),
+    repeat('9', 255)::DECIMAL(255, 0)))
+)",
+	                res);
+	REQUIRE(QuerySuccess(res, st));
+	REQUIRE(res.NextChunk());
+	REQUIRE(res.Value<std::string>(0, 0) == "-1234567890123456789012345678901234567890.0123456789");
+	REQUIRE(res.Value<std::string>(1, 0) == std::string(255, '9'));
+}
+
+TEST_CASE("Decimal wide query with unsupported precision", group_name) {
+	if (!DBMSConfigured("PostgreSQL")) {
+		return;
+	}
+	ScannerConn sc;
+	if (!WideDecimalsAvailable(sc)) {
+		return;
+	}
+	Result res;
+	bool st = Query(sc.conn,
+	                R"(
+FROM odbc_query(
+  getvariable('conn'),
+  '
+    SELECT CAST(''1.5'' AS NUMERIC(256, 2)) AS col1
+  ')
+)",
+	                res);
+	REQUIRE(!st);
+	REQUIRE(res.Error().find("Unsupported DECIMAL precision: 256, maximum supported precision: 255") !=
+	        std::string::npos);
+}

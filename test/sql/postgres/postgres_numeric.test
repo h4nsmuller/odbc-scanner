@@ -126,8 +126,175 @@ FROM odbc_query(getvariable('conn'), 'SELECT (''1.5'' || repeat(''0'', 600) || '
 ----
 value has more fractional digits than the column scale
 
-# NUMERIC types that are wider than DECIMAL(38) are mapped to DECIMAL(38),
+# NUMERIC types that are wider than DECIMAL(38) are mapped to the DECIMAL of the same precision and scale
+
+query I
+SELECT column_type from (
+  DESCRIBE FROM odbc_query(getvariable('conn'), '
+    SELECT
+      ''1.5''::NUMERIC(50,10) AS c1,
+      ''1.5''::NUMERIC(255,20) AS c2,
+      ''1.5''::NUMERIC(39,0) AS c3,
+      ''0.5''::NUMERIC(39,39) AS c4,
+      ''0.5''::NUMERIC(255,255) AS c5')
+)
+----
+DECIMAL(50,10)
+DECIMAL(255,20)
+DECIMAL(39,0)
+DECIMAL(39,39)
+DECIMAL(255,255)
+
+query IIIIII
+FROM odbc_query(getvariable('conn'), '
+  SELECT
+    ''1234567890123456789012345678901234567890.0123456789''::NUMERIC(50,10) AS c1,
+    ''-1234567890123456789012345678901234567890.0123456789''::NUMERIC(50,10) AS c2,
+    ''0''::NUMERIC(50,10) AS c3,
+    NULL::NUMERIC(50,10) AS c4,
+    ''-1.5''::NUMERIC(255,20) AS c5,
+    ''100000000000000000000000000000000000000''::NUMERIC(39,0) AS c6
+')
+----
+1234567890123456789012345678901234567890.0123456789
+-1234567890123456789012345678901234567890.0123456789
+0.0000000000
+NULL
+-1.50000000000000000000
+100000000000000000000000000000000000000
+
+# values with the maximum number of digits
+
+query IIIIII
+SELECT
+  c1::VARCHAR = repeat('9', 255),
+  c2::VARCHAR = '-' || repeat('9', 255),
+  c3 = ('0.' || repeat('9', 255))::DECIMAL(255,255),
+  c4 = ('-0.' || repeat('9', 255))::DECIMAL(255,255),
+  c5 = ('-0.' || repeat('9', 39))::DECIMAL(39,39),
+  c1 + c2
+FROM odbc_query(getvariable('conn'), '
+  SELECT
+    repeat(''9'', 255)::NUMERIC(255,0) AS c1,
+    (''-'' || repeat(''9'', 255))::NUMERIC(255,0) AS c2,
+    (''0.'' || repeat(''9'', 255))::NUMERIC(255,255) AS c3,
+    (''-0.'' || repeat(''9'', 255))::NUMERIC(255,255) AS c4,
+    (''-0.'' || repeat(''9'', 39))::NUMERIC(39,39) AS c5
+')
+----
+true
+true
+true
+true
+true
+0
+
+# digits of wide values are converted in groups, check the values around the group and the limb boundaries
+
+query II
+SELECT count(*), bool_and(c1::VARCHAR = txt)
+FROM odbc_query(getvariable('conn'), '
+  SELECT txt, txt::NUMERIC(100,7) AS c1 FROM (
+    SELECT sign || repeat(''1234567890'', n) || ''.'' || lpad(n::TEXT, 7, ''0'') AS txt
+    FROM generate_series(4, 9) AS t(n), (VALUES (''''), (''-'')) AS s(sign)
+    UNION ALL SELECT ''4294967296.0000000''
+    UNION ALL SELECT ''18446744073709551616.0000000''
+    UNION ALL SELECT ''-340282366920938463463374607431768211456.0000000''
+    UNION ALL SELECT ''999999999999999999.9999999''
+    UNION ALL SELECT ''1000000000000000000.0000000''
+    UNION ALL SELECT ''0.0000001''
+    UNION ALL SELECT ''-0.0000001''
+  ) AS q
+')
+----
+19
+true
+
+statement error
+FROM odbc_query(getvariable('conn'), 'SELECT ''NaN''::NUMERIC(50,10)')
+----
+cannot be represented as DECIMAL(50,10) without changing it: value is not a finite decimal number, value: 'NaN'
+
+# the widest supported DECIMAL has 255 digits
+
+statement error
+FROM odbc_query(getvariable('conn'), 'SELECT ''1.5''::NUMERIC(256,2)')
+----
+Unsupported DECIMAL precision: 256, maximum supported precision: 255
+
+statement error
+FROM odbc_query(getvariable('conn'), 'SELECT ''1.5''::NUMERIC(1000,500)')
+----
+Unsupported DECIMAL precision: 1000, maximum supported precision: 255
+
+# wide DECIMAL parameters
+
+query II
+FROM odbc_query(getvariable('conn'), 'SELECT ?::NUMERIC(50,10) AS c1, ?::NUMERIC(50,10) AS c2',
+  params=row(
+    '1234567890123456789012345678901234567890.0123456789'::DECIMAL(50,10),
+    '-1234567890123456789012345678901234567890.0123456789'::DECIMAL(50,10)))
+----
+1234567890123456789012345678901234567890.0123456789
+-1234567890123456789012345678901234567890.0123456789
+
+statement ok
+PREPARE pwide AS
+  SELECT c1::VARCHAR = repeat('9', 255), c2
+  FROM odbc_query(getvariable('conn'), 'SELECT ?::NUMERIC(255,0) AS c1, ?::NUMERIC(39,1) AS c2', params=row(?, ?))
+
+query II
+EXECUTE pwide(repeat('9', 255)::DECIMAL(255,0), '-1.5'::DECIMAL(39,1))
+----
+true
+-1.5
+
+query II
+EXECUTE pwide(NULL::DECIMAL(255,0), NULL::DECIMAL(39,1))
+----
+NULL
+NULL
+
+statement ok
+DEALLOCATE pwide
+
+# wide DECIMAL columns in odbc_copy
+
+statement ok
+CALL odbc_query(getvariable('conn'), 'DROP TABLE IF EXISTS odbc_scanner_wide_numeric')
+
+statement ok
+CALL odbc_query(getvariable('conn'), 'CREATE TABLE odbc_scanner_wide_numeric (id INTEGER, c1 NUMERIC(60,10), c2 NUMERIC(255,0))')
+
+query II
+SELECT completed, rows_processed FROM odbc_copy(getvariable('conn'),
+  dest_table='odbc_scanner_wide_numeric',
+  source_queries=['
+    SELECT 1 AS id, ''1234567890123456789012345678901234567890.0123456789''::DECIMAL(60,10) AS c1, repeat(''9'', 255)::DECIMAL(255,0) AS c2
+    UNION ALL
+    SELECT 2, ''-0.0000000001''::DECIMAL(60,10), (''-'' || repeat(''9'', 255))::DECIMAL(255,0)
+    UNION ALL
+    SELECT 3, NULL, NULL
+  ']) WHERE completed
+----
+true	3
+
+query IIII
+SELECT id, c1, c2::VARCHAR = repeat('9', 255), c2::VARCHAR = '-' || repeat('9', 255)
+FROM odbc_query(getvariable('conn'), 'SELECT id, c1, c2 FROM odbc_scanner_wide_numeric ORDER BY id')
+----
+1	1234567890123456789012345678901234567890.0123456789	true	false
+2	-0.0000000001	false	true
+3	NULL	NULL	NULL
+
+statement ok
+CALL odbc_query(getvariable('conn'), 'DROP TABLE odbc_scanner_wide_numeric')
+
+# when wide DECIMALs are disabled, wider NUMERIC types are mapped to DECIMAL(38),
 # values that do not fit it are reported, they are never truncated
+
+statement ok
+SET max_decimal_width = 38
 
 query I
 SELECT column_type from (
@@ -173,6 +340,9 @@ statement error
 FROM odbc_query(getvariable('conn'), 'SELECT ''0.000000000000000000000000000000000000001''::NUMERIC(50,45)')
 ----
 value has more fractional digits than the column scale
+
+statement ok
+RESET max_decimal_width
 
 # SQL_NUMERIC_STRUCT is used only when it is requested explicitly
 

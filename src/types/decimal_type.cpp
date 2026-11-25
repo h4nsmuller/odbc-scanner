@@ -31,9 +31,16 @@ template <>
 ScannerValue TypeSpecific::ExtractNotNullParam<DecimalValue>(const DbmsQuirks &quirks, Vector &vec, idx_t row_idx) {
 	auto ltype = vec.GetLogicalType();
 
+	if (static_cast<uint32_t>(ltype.GetDecimalWidth()) > OdbcType::MAX_FIXED_DECIMAL_WIDTH) {
+		// DECIMALs wider than 38 digits are stored as BIGNUM and do not fit into SQL_NUMERIC_STRUCT,
+		// such values are always passed to the driver as text
+		Value value = vec.GetValue(row_idx);
+		return ScannerValue(DecimalChars(value.ToText()));
+	}
+
 	DecimalValue dec;
-	dec.width = ltype.GetDecimalWidth();
-	dec.scale = ltype.GetDecimalScale();
+	dec.width = static_cast<uint8_t>(ltype.GetDecimalWidth());
+	dec.scale = static_cast<uint8_t>(ltype.GetDecimalScale());
 	dec.value.lower = 0;
 	dec.value.upper = 0;
 
@@ -109,9 +116,13 @@ template <>
 ScannerValue TypeSpecific::ExtractNotNullParam<DecimalValue>(const DbmsQuirks &quirks, const Value *value) {
 	// C++ API reads DECIMAL backing integers only for the width and scale known at compile time
 	LogicalType ltype = value->GetLogicalType();
+	if (static_cast<uint32_t>(ltype.GetDecimalWidth()) > OdbcType::MAX_FIXED_DECIMAL_WIDTH) {
+		// see the note about wide DECIMALs above
+		return ScannerValue(DecimalChars(value->ToText()));
+	}
 	DecimalValue val;
-	val.width = ltype.GetDecimalWidth();
-	val.scale = ltype.GetDecimalScale();
+	val.width = static_cast<uint8_t>(ltype.GetDecimalWidth());
+	val.scale = static_cast<uint8_t>(ltype.GetDecimalScale());
 	val.value = DecimalStorageFromText(value->ToText());
 	return ScannerValue(val, quirks.decimal_params_as_chars);
 }
@@ -199,7 +210,7 @@ static void SetDescriptorFields(const QueryContext &ctx, const OdbcType &odbc_ty
 	}
 
 	{
-		SQLSMALLINT precision = odbc_type.decimal_precision;
+		SQLSMALLINT precision = static_cast<SQLSMALLINT>(odbc_type.decimal_precision);
 		SQLRETURN ret = SQLSetDescField(hdesc, col_idx, SQL_DESC_PRECISION, reinterpret_cast<SQLPOINTER>(precision), 0);
 		if (!SQL_SUCCEEDED(ret)) {
 			std::string diag = Diagnostics::Read(ctx.hstmt(), SQL_HANDLE_STMT);
@@ -211,7 +222,7 @@ static void SetDescriptorFields(const QueryContext &ctx, const OdbcType &odbc_ty
 	}
 
 	{
-		SQLSMALLINT scale = odbc_type.decimal_scale;
+		SQLSMALLINT scale = static_cast<SQLSMALLINT>(odbc_type.decimal_scale);
 		SQLRETURN ret = SQLSetDescField(hdesc, col_idx, SQL_DESC_SCALE, reinterpret_cast<SQLPOINTER>(scale), 0);
 		if (!SQL_SUCCEEDED(ret)) {
 			std::string diag = Diagnostics::Read(ctx.hstmt(), SQL_HANDLE_STMT);
@@ -315,7 +326,7 @@ static bool IsZero(const Magnitude &num) {
 }
 
 // Checks that the number has at most the specified number of decimal digits, 38 digits max
-static bool FitsDigits(const Magnitude &num, uint8_t digits_count) {
+static bool FitsDigits(const Magnitude &num, uint32_t digits_count) {
 	// powers of ten from 10^0 to 10^38
 	static const std::vector<Magnitude> powers = [] {
 		std::vector<Magnitude> vec;
@@ -398,6 +409,55 @@ static void SetResult(const OdbcType &odbc_type, Vector &vec, idx_t row_idx, con
 		int128_t *data = vec.GetDataMutable<int128_t>();
 		data[row_idx] = hi;
 	}
+}
+
+// Converts decimal digits of a non-negative integer (without leading zeros) into its big-endian bytes
+static std::vector<uint8_t> DecimalDigitsToBytes(const std::string &digits) {
+	// little-endian 32-bit limbs, digits are added in groups of nine
+	std::vector<uint32_t> limbs;
+	for (size_t pos = 0; pos < digits.length();) {
+		size_t group_len = std::min<size_t>(9, digits.length() - pos);
+		uint64_t group = 0;
+		uint64_t multiplier = 1;
+		for (size_t i = 0; i < group_len; i++) {
+			group = group * 10 + static_cast<uint64_t>(digits[pos + i] - '0');
+			multiplier *= 10;
+		}
+		pos += group_len;
+
+		uint64_t carry = group;
+		for (uint32_t &limb : limbs) {
+			uint64_t cur = static_cast<uint64_t>(limb) * multiplier + carry;
+			limb = static_cast<uint32_t>(cur & LOW_32_BITS);
+			carry = cur >> 32;
+		}
+		if (carry != 0) {
+			limbs.push_back(static_cast<uint32_t>(carry));
+		}
+	}
+
+	std::vector<uint8_t> bytes;
+	for (auto it = limbs.rbegin(); it != limbs.rend(); it++) {
+		for (int shift = 24; shift >= 0; shift -= 8) {
+			uint8_t byte = static_cast<uint8_t>((*it >> shift) & 0xff);
+			if (byte != 0 || !bytes.empty()) {
+				bytes.push_back(byte);
+			}
+		}
+	}
+	if (bytes.empty()) {
+		bytes.push_back(0);
+	}
+	return bytes;
+}
+
+// DECIMALs wider than 38 digits are stored as BIGNUM that holds the unscaled value
+static void SetWideResult(Vector &vec, idx_t row_idx, const std::string &digits, bool negative) {
+	bignum_t::Decoded decoded;
+	decoded.magnitude = DecimalDigitsToBytes(digits);
+	decoded.is_negative = negative && !digits.empty();
+	std::vector<uint8_t> encoded = bignum_t::Encode(decoded);
+	vec.AssignStringUnsafe(row_idx, std::string_view(reinterpret_cast<const char *>(encoded.data()), encoded.size()));
 }
 
 static bool IsTruncationDiagCode(const std::string &code) {
@@ -672,6 +732,11 @@ static void FetchTextAndSetResult(const QueryContext &ctx, const OdbcType &odbc_
 
 	if (digits.length() > static_cast<size_t>(odbc_type.decimal_precision)) {
 		ThrowDoesNotFit(ctx, odbc_type, col_idx, "value has more digits than the column precision", text);
+	}
+
+	if (odbc_type.decimal_precision > OdbcType::MAX_FIXED_DECIMAL_WIDTH) {
+		SetWideResult(vec, row_idx, digits, negative);
+		return;
 	}
 
 	// cannot overflow, the number has 38 digits at most

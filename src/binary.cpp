@@ -70,6 +70,12 @@ DecimalChars::DecimalChars(DecimalValue decimal) {
 	std::memcpy(this->characters.data(), chars.c_str(), len);
 }
 
+DecimalChars::DecimalChars(const std::string &text) {
+	size_t len = text.length();
+	this->characters.resize(len + 1);
+	std::memcpy(this->characters.data(), text.c_str(), len);
+}
+
 char *DecimalChars::data() {
 	return characters.data();
 }

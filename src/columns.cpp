@@ -1,5 +1,6 @@
 #include "columns.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -64,9 +65,10 @@ static OdbcType GetTypeAttributes(const std::string &query, SQLSMALLINT cols_cou
 	}
 	std::string desc_type_name = WideChar::Narrow(buf.data(), len_bytes / sizeof(SQLWCHAR));
 
-	uint8_t decimal_precision = 0;
-	uint8_t decimal_scale = 0;
+	uint32_t decimal_precision = 0;
+	uint32_t decimal_scale = 0;
 	SQLLEN decimal_source_precision = 0;
+	SQLLEN decimal_source_scale = 0;
 	if (desc_concise_type == SQL_DECIMAL || desc_concise_type == SQL_NUMERIC) {
 		{
 			SQLLEN precision = 0;
@@ -79,9 +81,12 @@ static OdbcType GetTypeAttributes(const std::string &query, SQLSMALLINT cols_cou
 				    "', return: " + std::to_string(ret) + ", diagnostics: '" + diag + "'");
 			}
 			// Drivers report zero precision for unconstrained types (like NUMBER in Oracle), and the source type
-			// can be wider than DECIMAL(38), in both cases the column is mapped to the widest DECIMAL
-			// and every fetched value is checked to fit it exactly.
-			decimal_precision = static_cast<uint8_t>(precision >= 1 && precision <= 38 ? precision : 38);
+			// can be wider than DECIMAL(38), in both cases the column is mapped to the widest fixed-size DECIMAL
+			// and every fetched value is checked to fit it exactly. Columns::AddToResults widens this mapping
+			// to the declared precision when DuckDB supports DECIMALs wider than 38 digits.
+			SQLLEN max_precision = static_cast<SQLLEN>(OdbcType::MAX_FIXED_DECIMAL_WIDTH);
+			decimal_precision =
+			    static_cast<uint32_t>(precision >= 1 && precision <= max_precision ? precision : max_precision);
 			decimal_source_precision = precision;
 		}
 
@@ -101,12 +106,13 @@ static OdbcType GetTypeAttributes(const std::string &query, SQLSMALLINT cols_cou
 				    std::to_string(scale) + ", column index: " + std::to_string(col_idx) + ", query: '" + query + "'");
 			}
 			SQLLEN precision = static_cast<SQLLEN>(decimal_precision);
-			decimal_scale = static_cast<uint8_t>(scale <= precision ? scale : precision);
+			decimal_scale = static_cast<uint32_t>(scale <= precision ? scale : precision);
+			decimal_source_scale = scale;
 		}
 	}
 
 	return OdbcType(desc_type, desc_concise_type, is_unsigned == SQL_TRUE, std::move(desc_type_name), decimal_precision,
-	                decimal_scale, decimal_source_precision);
+	                decimal_scale, decimal_source_precision, decimal_source_scale);
 }
 
 std::vector<ResultColumn> Columns::Collect(const QueryContext &ctx) {
@@ -178,9 +184,46 @@ void Columns::CheckSame(const QueryContext &ctx, const std::vector<ResultColumn>
 	}
 }
 
+// DECIMALs wider than 38 digits are not available in older DuckDB versions, and can be
+// disabled in newer ones with the 'max_decimal_width' option
+static bool WideDecimalsSupported(Factory &factory, uint32_t precision, uint32_t scale) {
+	try {
+		factory.ParseType("DECIMAL(" + std::to_string(precision) + ", " + std::to_string(scale) + ")");
+		return true;
+	} catch (std::exception &) {
+		return false;
+	}
+}
+
+// A column that is declared wider than DECIMAL(38) in the source is mapped to the DECIMAL of the same precision
+// and scale when DuckDB can hold it, otherwise it stays mapped to DECIMAL(38).
+static void WidenDecimalMapping(Factory &factory, ResultColumn &col) {
+	OdbcType &odbc_type = col.odbc_type;
+	if (!odbc_type.DecimalExceedsNumericStruct()) {
+		return;
+	}
+	SQLLEN max_precision = static_cast<SQLLEN>(OdbcType::MAX_WIDE_DECIMAL_WIDTH);
+	SQLLEN capped_precision = std::min(odbc_type.decimal_source_precision, max_precision);
+	uint32_t precision = static_cast<uint32_t>(capped_precision);
+	uint32_t scale = static_cast<uint32_t>(std::min(odbc_type.decimal_source_scale, capped_precision));
+	if (!WideDecimalsSupported(factory, precision, scale)) {
+		return;
+	}
+	if (odbc_type.decimal_source_precision > max_precision) {
+		throw ScannerException("Unsupported DECIMAL precision: " + std::to_string(odbc_type.decimal_source_precision) +
+		                       ", maximum supported precision: " + std::to_string(max_precision) + ", column name: '" +
+		                       col.name + "', column type: " + odbc_type.ToString() +
+		                       ". Cast this column in the remote query to a narrower DECIMAL type, " +
+		                       "or to a character type to fetch it as VARCHAR.");
+	}
+	odbc_type.decimal_precision = precision;
+	odbc_type.decimal_scale = scale;
+}
+
 void Columns::AddToResults(TableFunction::BindInput &input, Factory &factory, LogicalTypeId type_id,
                            ResultColumn &col) {
 	if (type_id == LogicalTypeId::DECIMAL) {
+		WidenDecimalMapping(factory, col);
 		auto ltype = factory.ParseType("DECIMAL(" + std::to_string(col.odbc_type.decimal_precision) + ", " +
 		                               std::to_string(col.odbc_type.decimal_scale) + ")");
 		input.AddResultColumn(col.name, ltype);

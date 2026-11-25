@@ -228,6 +228,12 @@ ScannerValue::ScannerValue(DecimalValue value, bool decimal_as_chars) {
 	}
 }
 
+ScannerValue::ScannerValue(DecimalChars value) : type_id(Params::TYPE_DECIMAL_AS_CHARS) {
+	new (&this->val.decimal_chars) DecimalChars;
+	this->val.decimal_chars = std::move(value);
+	this->len_bytes = val.decimal_chars.size<SQLLEN>();
+}
+
 ScannerValue::ScannerValue(SQL_NUMERIC_STRUCT value)
     : type_id(ToParamType(LogicalTypeId::DECIMAL)), len_bytes(sizeof(value)), val(value) {
 }

@@ -193,10 +193,8 @@ struct SourceReader {
 				LogicalTypeId type_id = Types::TypeIdOf(ltype);
 				std::vector<uint32_t> typmods;
 				if (type_id == LogicalTypeId::DECIMAL) {
-					uint8_t width = ltype.GetDecimalWidth();
-					typmods.push_back(static_cast<uint32_t>(width));
-					uint8_t scale = ltype.GetDecimalScale();
-					typmods.push_back(static_cast<uint32_t>(scale));
+					typmods.push_back(static_cast<uint32_t>(ltype.GetDecimalWidth()));
+					typmods.push_back(static_cast<uint32_t>(ltype.GetDecimalScale()));
 				}
 				SourceColumn col(std::move(name), type_id, std::move(typmods));
 				this->columns.emplace_back(std::move(col));
